@@ -21,8 +21,8 @@ This project was created to streamline the installation process of likelovewant'
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/yourusername/ollama-for-amd-installer.git
-   cd ollama-for-amd-installer
+   git clone https://github.com/ByronLeeeee/Ollama-For-AMD-Installer.git
+   cd Ollama-For-AMD-Installer
    ```
 
 2. **Install Dependencies**:
