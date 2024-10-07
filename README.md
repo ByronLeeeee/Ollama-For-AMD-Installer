@@ -1,7 +1,7 @@
 # Ollama-For-AMD-Installer
 
 ## Overview
-We would like to extend our heartfelt thanks to [likelovewant](https://github.com/likelovewant/) for their invaluable contribution with the [ollama-for-amd library](https://github.com/likelovewant/ollama-for-amd). 
+I would like to extend my heartfelt thanks to [likelovewant](https://github.com/likelovewant/) for the [ollama-for-amd library](https://github.com/likelovewant/ollama-for-amd). 
 
 This project was created to streamline the installation process of likelovewant's library, making it easier for users to manage and update their AMD GPU-compatible Ollama installations.
 
