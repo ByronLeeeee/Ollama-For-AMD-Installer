@@ -33,7 +33,9 @@ This project was created to streamline the installation process of likelovewant'
    pip install -r requirements.txt
    ```
 
-OR just download the latest release from the [releases page](https://github.com/ByronLeeeee/Ollama-For-AMD-Installer/releases).
+OR 
+
+Just download the latest release from the [releases page](https://github.com/ByronLeeeee/Ollama-For-AMD-Installer/releases).
 
 
 
