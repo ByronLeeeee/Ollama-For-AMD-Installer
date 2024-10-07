@@ -74,35 +74,37 @@ class OllamaInstallerGUI:
         self.load_settings()
 
     def create_widgets(self):
-        ttk.Label(self.master, text="GPU Model:").pack(pady=5)
+        ttk.Label(self.master, text="GPU Model:").grid(row=0, column=0, pady=5, padx=10, sticky="w")
         self.gpu_var = tk.StringVar()
         self.gpu_combo = ttk.Combobox(self.master, textvariable=self.gpu_var)
         self.gpu_combo['values'] = list(GPU_ROCM_MAPPING.keys())
-        self.gpu_combo.pack(pady=5)
+        self.gpu_combo.grid(row=0, column=1, pady=5, padx=10, sticky="w")
 
         self.proxy_check = ttk.Checkbutton(
             self.master, text="Use Proxy Mirror", variable=self.use_proxy)
-        self.proxy_check.pack(pady=5)
+        self.proxy_check.grid(row=1, column=0, columnspan=2, pady=5, padx=10, sticky="w")
 
         self.check_button = ttk.Button(
             self.master, text="Check for New Version", command=self.check_version_thread)
-        self.check_button.pack(pady=10)
+        self.check_button.grid(row=2, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
+
         self.replace_button = ttk.Button(
             self.master, text="Replace ROCm Libraries Only", command=self.download_and_replace_rocblas)
-        self.replace_button.pack(pady=10)
+        self.replace_button.grid(row=3, column=0, pady=10, padx=10, sticky="ew")
+
         self.fix_button = ttk.Button(
             self.master, text="Fix 0xc0000005 Error", command=self.fix_05Error)
-        self.fix_button.pack(pady=10)
+        self.fix_button.grid(row=3, column=1, columnspan=2, pady=10, padx=10, sticky="ew")
 
         self.progress = ttk.Progressbar(
             self.master, length=300, mode='determinate')
-        self.progress.pack(pady=10)
+        self.progress.grid(row=4, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
 
         self.speed_label = ttk.Label(self.master, text="Download Speed: 0 KB/s")
-        self.speed_label.pack(pady=5)
+        self.speed_label.grid(row=5, column=0, columnspan=2, pady=5, padx=10, sticky="w")
 
         self.status_label = ttk.Label(self.master, text="")
-        self.status_label.pack(pady=5)
+        self.status_label.grid(row=6, column=0, columnspan=2, pady=5, padx=10, sticky="w")
 
     def get_url_with_proxy(self, url):
         return f"https://ghp.ci/{url}" if self.use_proxy.get() else url
