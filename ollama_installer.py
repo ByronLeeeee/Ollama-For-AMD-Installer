@@ -145,39 +145,72 @@ class OllamaInstallerGUI:
             messagebox.showerror("Error", f"Error during download or installation: {e}")
 
     def download_file(self, url, filename):
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 KB
-        written = 0
-        start_time = time.time()
+        try:
+            if not self.is_valid_url(url):
+                raise ValueError("Invalid URL")
+            
+            response = requests.get(url, stream=True)
+            total_size = int(response.headers.get('content-length', 0))
 
-        with open(filename, 'wb') as file, tqdm(
-                desc=filename,
-                total=total_size,
-                unit='iB',
-                unit_scale=True,
-                unit_divisor=1024,
-        ) as progress_bar:
-            for data in response.iter_content(block_size):
-                size = file.write(data)
-                written += size
-                progress_bar.update(size)
-                self.update_progress(written, total_size)
-                self.update_speed(written, start_time)
+            if total_size == 0:
+                print("File size is zero or unknown.")
+                return
+            
+            block_size = 1024  # 1 KB
+            written = 0
+            start_time = time.time()
+
+            with open(filename, 'wb') as file, tqdm(
+                    desc=filename,
+                    total=total_size,
+                    unit='iB',
+                    unit_scale=True,
+                    unit_divisor=1024,
+            ) as progress_bar:
+                for data in response.iter_content(block_size):
+                    size = file.write(data)
+                    written += size
+                    progress_bar.update(size)
+                    self.update_progress(written, total_size)
+                    self.update_speed(written, start_time)
+        except requests.exceptions.RequestException as e:
+            print(f"Request error: {e}")
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            if os.path.exists(filename):
+                os.remove(filename)
+    
+    def is_valid_url(self, url):
+        return bool(requests.utils.urlparse(url).netloc)
 
     def update_progress(self, current, total):
-        progress = int((current / total) * 100)
-        self.progress['value'] = progress
-        self.master.update_idletasks()
+        if not (isinstance(current, (int, float)) and isinstance(total, (int, float))):
+            raise ValueError("Both 'current' and 'total' must be numbers.")
+        
+        try:
+            if total == 0:
+                progress = 0
+            else:
+                progress = int((current / total) * 100)
+            
+            self.progress['value'] = progress
+            self.master.update_idletasks()
+        except Exception as e:
+            print(f"An error occurred: {e}")
 
     def update_speed(self, downloaded, start_time):
-        elapsed_time = time.time() - start_time
-        if elapsed_time > 0:
-            speed = downloaded / (1024 * elapsed_time)
-            self.speed_label.config(text=f"Download Speed: {speed:.2f} KB/s")
-        else:
-            self.speed_label.config(text="Calculating speed...")
-        self.master.update_idletasks()
+        try:
+            elapsed_time = time.time() - start_time
+            if elapsed_time < 0.001:
+                text = "Calculating speed..."
+            else:
+                speed = downloaded / (1024 * elapsed_time)
+                text = f"Download Speed: {speed:.2f} KB/s"
+            
+            self.speed_label.config(text=text)
+            self.master.update_idletasks()
+        except Exception as e:
+            print(f"Error updating speed: {e}")
 
     def install_exe(self, filename):
         self.status_label.config(text="Installing...")
