@@ -172,8 +172,11 @@ class OllamaInstallerGUI:
 
     def update_speed(self, downloaded, start_time):
         elapsed_time = time.time() - start_time
-        speed = downloaded / (1024 * elapsed_time)
-        self.speed_label.config(text=f"Download Speed: {speed:.2f} KB/s")
+        if elapsed_time > 0:
+            speed = downloaded / (1024 * elapsed_time)
+            self.speed_label.config(text=f"Download Speed: {speed:.2f} KB/s")
+        else:
+            self.speed_label.config(text="Calculating speed...")
         self.master.update_idletasks()
 
     def install_exe(self, filename):
