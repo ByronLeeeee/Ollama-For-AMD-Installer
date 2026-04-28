@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, scrolledtext
 import requests
 import os
 import subprocess
@@ -296,7 +296,6 @@ class OllamaInstallerGUI:
         self.base_url = f"https://github.com/{self.repo}/releases/download"
         self.github_url = "https://github.com/ByronLeeeee/Ollama-For-AMD-Installer"
         self.gpu_var = tk.StringVar()
-        self.ollama_path_var = tk.StringVar()
         self.github_access_token_var = tk.StringVar()
 
         self.create_widgets()
@@ -327,36 +326,23 @@ class OllamaInstallerGUI:
             self.master, text="🚀 Installation Actions", padding=(10, 5))
         actions_frame.grid(row=1, column=0, columnspan=2,
                            pady=5, padx=10, sticky="ew")
-        actions_frame.columnconfigure(1, weight=1)
-
-        # Path Selection
-        ttk.Label(actions_frame, text="Ollama Path:").grid(
-            row=0, column=0, pady=5, padx=5, sticky="w")
-        self.path_entry = ttk.Entry(
-            actions_frame, textvariable=self.ollama_path_var)
-        self.path_entry.grid(row=0, column=1, pady=5, padx=5, sticky="ew")
-        
-        path_btns_frame = ttk.Frame(actions_frame)
-        path_btns_frame.grid(row=0, column=2, pady=5, padx=5, sticky="e")
-        
-        ttk.Button(path_btns_frame, text="📂 Browse", command=self.browse_path, width=10).pack(side="left", padx=2)
-        ttk.Button(path_btns_frame, text="🔄 Reset", command=self.reset_path, width=10).pack(side="left", padx=2)
+        actions_frame.columnconfigure(0, weight=1)
 
         self.check_button = ttk.Button(
             actions_frame, text="1. Full Install (App + AMD Libs)", command=self.full_install_thread)
         self.check_button.grid(
-            row=1, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
+            row=0, column=0, columnspan=2, pady=5, padx=5, sticky="ew")
 
         self.replace_button = ttk.Button(
             actions_frame, text="2. Inject AMD Libs Only", command=self.replace_only_thread)
         self.replace_button.grid(
-            row=2, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
+            row=1, column=0, columnspan=2, pady=5, padx=5, sticky="ew")
 
         self.vulkan_button = ttk.Button(
             actions_frame, text="3. Force Vulkan Mode (Optional fix if GPU still not detected)",
             command=self.enable_vulkan_thread)
         self.vulkan_button.grid(
-            row=3, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
+            row=2, column=0, columnspan=2, pady=5, padx=5, sticky="ew")
 
         # Configuration and manual fixes section
         troubleshoot_frame = ttk.LabelFrame(
@@ -367,11 +353,8 @@ class OllamaInstallerGUI:
 
         self.fix_button = ttk.Button(
             troubleshoot_frame, text="Fix 0xc0000005 Error", command=self.fix_05Error_thread)
-        self.fix_button.grid(row=0, column=0, pady=5, padx=5, sticky="ew")
-
-        self.cleanup_button = ttk.Button(
-            troubleshoot_frame, text="Cleanup AMD Libs", command=self.cleanup_thread)
-        self.cleanup_button.grid(row=0, column=1, pady=5, padx=5, sticky="ew")
+        self.fix_button.grid(row=0, column=0, columnspan=2,
+                             pady=5, padx=5, sticky="ew")
 
         ttk.Label(troubleshoot_frame, text="GitHub PAT:").grid(
             row=1, column=0, pady=5, sticky="w")
@@ -409,17 +392,6 @@ class OllamaInstallerGUI:
         link.bind("<Button-1>", lambda e: webbrowser.open_new_tab(self.github_url))
 
         self.log_msg("Ready for input.")
-
-    def browse_path(self):
-        """Open a directory selection dialog."""
-        directory = filedialog.askdirectory()
-        if directory:
-            self.ollama_path_var.set(os.path.normpath(directory))
-
-    def reset_path(self):
-        """Clear manual path and revert to auto-detection."""
-        self.ollama_path_var.set("")
-        self.log_msg("Manual path cleared. Reverting to auto-detection.")
 
     def log_msg(self, message: str):
         """Append a message to the UI console and the log file."""
@@ -507,23 +479,6 @@ class OllamaInstallerGUI:
 
     def find_ollama_path(self) -> Optional[str]:
         """Discover the installation directory of Ollama."""
-        # Check manual input first
-        manual_path = self.ollama_path_var.get().strip()
-        if manual_path:
-            if os.path.exists(manual_path):
-                # Validate that it looks like an Ollama directory
-                if os.path.exists(os.path.join(manual_path, "ollama.exe")):
-                    return manual_path
-                else:
-                    self.log_msg(f"⚠️ Warning: 'ollama.exe' not found in {manual_path}")
-                    if not messagebox.askyesno("Invalid Path?", 
-                        f"The selected folder does not appear to contain 'ollama.exe'.\n\nPath: {manual_path}\n\nDo you want to use it anyway?"):
-                        return None
-                    return manual_path
-            else:
-                self.log_msg(f"❌ Error: Selected path does not exist: {manual_path}")
-                return None
-
         for root_key in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
             try:
                 hkey = winreg.OpenKey(
@@ -578,105 +533,6 @@ class OllamaInstallerGUI:
         """Start 0xc0000005 error fix in a background thread."""
         threading.Thread(target=self.fix_05Error, daemon=True).start()
 
-    def cleanup_thread(self):
-        """Start cleanup in a background thread."""
-        threading.Thread(target=self._execute_cleanup, daemon=True).start()
-
-    def _execute_cleanup(self):
-        """Perform a complete undo of the installation/injection workflow."""
-        try:
-            self.set_ui_state("disabled")
-            ollama_path = self.find_ollama_path()
-            if not ollama_path:
-                self.log_msg("❌ Cleanup aborted: No target path identified.")
-                return
-
-            msg = (f"This will completely REMOVE injected files and components from:\n{ollama_path}\n\n"
-                   "This includes:\n"
-                   "- ollama.exe & ollama app.exe\n"
-                   "- The entire 'lib' folder (ROCm libraries & runners)\n"
-                   "- Vulkan & ROCm environment overrides\n\n"
-                   "Note: This effectively uninstalls the AMD-compatible Ollama. Continue?")
-            
-            if not messagebox.askyesno("Confirm Full Undo", msg):
-                self.log_msg("Cleanup cancelled by user.")
-                return
-
-            self.kill_ollama()
-            self.log_msg(f"Initiating full undo in target path: {ollama_path}")
-
-            # 1. Remove Environment Variables
-            self.log_msg("Step 1/3: Cleaning up registry environment variables...")
-            try:
-                reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS)
-                for var in ["OLLAMA_VULKAN", "HSA_OVERRIDE_GFX_VERSION"]:
-                    try:
-                        winreg.DeleteValue(reg_key, var)
-                        self.log_msg(f"  [REGISTRY] Successfully deleted environment variable: {var}")
-                    except FileNotFoundError:
-                        self.log_msg(f"  [REGISTRY] Variable {var} not found, skipping.")
-                winreg.CloseKey(reg_key)
-            except Exception as e:
-                self.log_msg(f"  [ERROR] Registry operation failed: {e}")
-
-            # 2. Remove Files and Folders
-            self.log_msg("Step 2/3: Removing application files and libraries...")
-            targets = ["ollama.exe", "ollama app.exe", "lib"]
-            for target in targets:
-                target_path = os.path.normpath(os.path.join(ollama_path, target))
-                if os.path.exists(target_path):
-                    self.log_msg(f"  [FILESYSTEM] Attempting to remove: {target_path}")
-                    try:
-                        if os.path.isdir(target_path):
-                            shutil.rmtree(target_path, ignore_errors=True)
-                            if os.path.exists(target_path):
-                                self.log_msg(f"  [WARN] Failed to delete directory {target} completely (likely in use).")
-                            else:
-                                self.log_msg(f"  [OK] Directory {target} removed.")
-                        else:
-                            os.remove(target_path)
-                            self.log_msg(f"  [OK] File {target} removed.")
-                    except Exception as e:
-                        self.log_msg(f"  [ERROR] Failed to remove {target}: {e}")
-                else:
-                    self.log_msg(f"  [FILESYSTEM] Component {target} not found at {target_path}, skipping.")
-
-            # 3. Final Path cleanup (Audit Only)
-            self.log_msg("Step 3/3: Performing final directory audit...")
-            try:
-                if os.path.exists(ollama_path):
-                    contents = os.listdir(ollama_path)
-                    if not contents:
-                        self.log_msg(f"  [INFO] Target directory {ollama_path} is now empty.")
-                    else:
-                        self.log_msg(f"  [INFO] Target directory {ollama_path} still contains other files ({len(contents)} items).")
-                    self.log_msg(f"  [INFO] Base directory preserved.")
-            except Exception as e:
-                self.log_msg(f"  [ERROR] Final audit failed: {e}")
-
-            self.log_msg("✅ Full undo/cleanup completed successfully.")
-            self._show_info("Cleanup Complete", "All components have been removed.")
-        except Exception as e:
-            self.log_msg(f"❌ CRITICAL ERROR during cleanup: {e}")
-            logging.exception("Cleanup failure details:")
-            self._show_error("Error", f"Cleanup failed: {e}")
-        finally:
-            self.set_ui_state("normal")
-
-    def find_ollama_path_from_registry(self) -> Optional[str]:
-        """Helper to get path strictly from system registry."""
-        for root_key in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
-            try:
-                hkey = winreg.OpenKey(
-                    root_key, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Ollama")
-                install_path = winreg.QueryValueEx(hkey, "InstallLocation")[0]
-                winreg.CloseKey(hkey)
-                if os.path.exists(install_path):
-                    return install_path
-            except Exception:
-                pass
-        return None
-
     def _execute_enable_vulkan(self):
         """Configure system environment for Vulkan acceleration."""
         try:
@@ -712,14 +568,7 @@ class OllamaInstallerGUI:
             self.download_file(exe_url, exe_filename, is_github_url=False)
             self.log_msg("Launching setup...")
             self.kill_ollama()
-            
-            install_args = [exe_filename, "/SILENT"]
-            custom_dir = self.ollama_path_var.get().strip()
-            if custom_dir:
-                install_args.append(f'/DIR={custom_dir}')
-                self.log_msg(f"Target directory: {custom_dir}")
-                
-            subprocess.run(install_args, check=True)
+            subprocess.run([exe_filename, "/SILENT"], check=True)
             self._execute_replace_only()
         except Exception as e:
             self.log_msg(f"Installer error: {e}")
@@ -737,91 +586,66 @@ class OllamaInstallerGUI:
                     "Incomplete Input", "Select a GPU profile.")
                 return
 
-            self.log_msg(f"🚀 Injection started for GPU Profile: {gpu_model}")
             version_tag = self.get_latest_release()
-            self.log_msg(f"Latest release found: {version_tag}")
-            
             os.makedirs(version_tag, exist_ok=True)
             proxy_url = self.proxy_selector.get_selected_proxy_url()
-            self.log_msg(f"Using proxy: {proxy_url if proxy_url else 'None'}")
-            
             ollama_path = self.find_ollama_path()
             if not ollama_path:
-                self.log_msg("❌ Error: Ollama installation path not found. Please select it manually.")
-                self._show_error("Path Not Found", "Ollama installation directory could not be located. Please use the 'Browse' button to select it.")
                 return
 
-            self.log_msg(f"Target path verified: {ollama_path}")
             rocm_lib_dir = os.path.join(ollama_path, "lib", "ollama", "rocm")
             base_archive = os.path.join(version_tag, "ollama-windows-amd64.7z")
 
             if not os.path.exists(base_archive):
-                self.log_msg(f"Step 1/3: Downloading core framework archive: {os.path.basename(base_archive)}")
+                self.log_msg("Downloading foundational components...")
                 self.download_file(
                     f"{proxy_url}{self.base_url}/{version_tag}/ollama-windows-amd64.7z", base_archive)
-            else:
-                self.log_msg("Step 1/3: Found cached core framework, skipping download.")
 
             self.kill_ollama()
+            self.log_msg("Extracting framework...")
             
-            self.log_msg("Step 2/3: Extracting and deploying core framework...")
             temp_fw_dir = tempfile.mkdtemp()
-            self.log_msg(f"  [TEMP] Creating extraction workspace: {temp_fw_dir}")
-            try:
-                with py7zr.SevenZipFile(base_archive, 'r') as archive:
-                    self.log_msg("  [EXTRACT] Unpacking files...")
-                    archive.extractall(path=temp_fw_dir)
-                    
-                fw_extracted_root = os.path.join(temp_fw_dir, "windows-amd64")
-                if not os.path.exists(fw_extracted_root):
-                    fw_extracted_root = temp_fw_dir
+            with py7zr.SevenZipFile(base_archive, 'r') as archive:
+                archive.extractall(path=temp_fw_dir)
                 
-                self.log_msg(f"  [DEPLOY] Moving framework files to {ollama_path}...")
-                shutil.copytree(fw_extracted_root, ollama_path, dirs_exist_ok=True)
-            finally:
-                self.log_msg("  [TEMP] Cleaning up workspace.")
-                shutil.rmtree(temp_fw_dir, ignore_errors=True)
+            fw_extracted_root = os.path.join(temp_fw_dir, "windows-amd64")
+            if not os.path.exists(fw_extracted_root):
+                fw_extracted_root = temp_fw_dir
+                
+            shutil.copytree(fw_extracted_root, ollama_path, dirs_exist_ok=True)
+            shutil.rmtree(temp_fw_dir, ignore_errors=True)
 
             gpu_url = get_rocm_url(gpu_model)
             if not gpu_url:
-                raise ValueError(f"Could not resolve download URL for profile: {gpu_model}")
+                raise ValueError("No URL for selected profile.")
 
             gpu_archive = os.path.join(version_tag, os.path.basename(gpu_url))
             if not os.path.exists(gpu_archive):
-                self.log_msg(f"Step 3/3: Downloading specific driver libs for {gpu_model}...")
+                self.log_msg(f"Downloading driver libs for {gpu_model}...")
                 self.download_file(f"{proxy_url}{gpu_url}", gpu_archive)
-            else:
-                self.log_msg("Step 3/3: Found cached driver libs, skipping download.")
 
-            self.log_msg(f"Deploying ROCm DLLs to {rocm_lib_dir}...")
+            self.log_msg("Deploying DLLs...")
             temp_dir = tempfile.mkdtemp()
-            try:
-                with py7zr.SevenZipFile(gpu_archive, "r") as zip_ref:
-                    self.log_msg("  [EXTRACT] Unpacking driver libs...")
-                    zip_ref.extractall(path=temp_dir)
+            with py7zr.SevenZipFile(gpu_archive, "r") as zip_ref:
+                zip_ref.extractall(path=temp_dir)
 
-                payload_root = temp_dir
-                if len(os.listdir(temp_dir)) == 1:
-                    payload_root = os.path.join(temp_dir, os.listdir(temp_dir)[0])
+            payload_root = temp_dir
+            if len(os.listdir(temp_dir)) == 1:
+                payload_root = os.path.join(temp_dir, os.listdir(temp_dir)[0])
 
-                self.log_msg(f"  [DEPLOY] Injecting rocblas.dll into {rocm_lib_dir}...")
-                shutil.copy2(os.path.join(payload_root, "rocblas.dll"), rocm_lib_dir)
-                
-                lib_content = os.path.join(payload_root, "library")
-                if os.path.exists(lib_content):
-                    self.log_msg("  [DEPLOY] Injecting rocblas library folder...")
-                    shutil.copytree(lib_content, os.path.join(
-                        rocm_lib_dir, "rocblas", "library"), dirs_exist_ok=True)
-            finally:
-                self.log_msg("  [TEMP] Cleaning up driver workspace.")
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.copy2(os.path.join(
+                payload_root, "rocblas.dll"), rocm_lib_dir)
+            lib_content = os.path.join(payload_root, "library")
+            if os.path.exists(lib_content):
+                shutil.copytree(lib_content, os.path.join(
+                    rocm_lib_dir, "rocblas", "library"), dirs_exist_ok=True)
 
-            self.log_msg("✅ Injection successful! All AMD libraries are in place.")
+            self.log_msg("✅ Library injection successful.")
             self._show_info(
                 "Success", "Hardware acceleration libraries updated.")
+            shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
-            self.log_msg(f"❌ CRITICAL ERROR during injection: {e}")
-            logging.exception("Injection failure details:")
+            self.log_msg(f"Injection failure: {e}")
             self._show_error("Error", f"Process failed: {e}")
         finally:
             self.set_ui_state("normal")
@@ -833,8 +657,6 @@ class OllamaInstallerGUI:
             self.log_msg("Applying runtime fix...")
             ollama_path = self.find_ollama_path()
             if not ollama_path:
-                self.log_msg("❌ Error: Ollama installation path not found. Please select it manually.")
-                self._show_error("Path Not Found", "Ollama installation directory could not be located. Please use the 'Browse' button to select it.")
                 return
             self.kill_ollama()
             base_lib = os.path.join(ollama_path, "lib", "ollama")
@@ -913,12 +735,10 @@ class OllamaInstallerGUI:
         self.master.after(0, self._set_ui_state_sync, state)
 
     def _set_ui_state_sync(self, state):
-        self.path_entry.config(state=state)
         self.check_button.config(state=state)
         self.replace_button.config(state=state)
         self.vulkan_button.config(state=state)
         self.fix_button.config(state=state)
-        self.cleanup_button.config(state=state)
         self.detect_btn.config(state=state)
 
     def load_settings(self):
@@ -926,15 +746,9 @@ class OllamaInstallerGUI:
         try:
             if os.path.exists("settings.txt"):
                 with open("settings.txt", "r") as config_file:
-                    lines = config_file.readlines()
-                    if len(lines) >= 1:
-                        gpu_val = lines[0].strip()
-                        if gpu_val in GPU_ROCM_MAPPING:
-                            self.gpu_var.set(gpu_val)
-                    if len(lines) >= 2:
-                        path_val = lines[1].strip()
-                        if os.path.exists(path_val):
-                            self.ollama_path_var.set(path_val)
+                    saved_val = config_file.readline().strip()
+                    if saved_val in GPU_ROCM_MAPPING:
+                        self.gpu_var.set(saved_val)
         except Exception:
             pass
 
@@ -943,7 +757,6 @@ class OllamaInstallerGUI:
         try:
             with open("settings.txt", "w") as config_file:
                 config_file.write(f"{self.gpu_var.get()}\n")
-                config_file.write(f"{self.ollama_path_var.get()}\n")
         except Exception:
             pass
 
