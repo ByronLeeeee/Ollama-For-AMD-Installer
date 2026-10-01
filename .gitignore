@@ -4,3 +4,8 @@ settings.txt
 .venv/
 dist/
 build/
+.venv-maintenance/
+__pycache__/
+downloads/
+artifacts/
+proxy_config.json

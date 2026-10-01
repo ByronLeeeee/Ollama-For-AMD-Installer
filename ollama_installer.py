@@ -3,22 +3,29 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog
 import requests
 import os
 import subprocess
-import py7zr
 import ctypes
 import sys
 import threading
 import time
-from tqdm import tqdm
 import logging
 import shutil
 import tempfile
 import json
 import webbrowser
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
 from typing import Dict, Optional, List
+from pathlib import Path
+from urllib.parse import urlsplit
+from installer_core import (AMD_REPO, LIB_REPO, GPU_PACKAGES, ROCM_VERSIONS,
+                            select_release, select_gpu_asset, match_gpu, verify_asset,
+                            extract_archive, prepare_payload, deploy_payload,
+                            latest_backup, restore_backup, CompatibilityError, parse_client_version)
 
 # Version constant
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 
 class APILimitRateError(Exception):
@@ -34,29 +41,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Repository and download metadata
-ROCM_VERSION_TAG = "v0.6.4.2"
-BASE_URL = f"https://github.com/likelovewant/ROCmLibs-for-gfx1103-AMD780M-APU/releases/download/{ROCM_VERSION_TAG}/"
-
-# Mapping of GPU families to specific ROCm library packages
-GPU_ROCM_MAPPING = {
-    "Official Support (Navi 31/32, Vega 20, 890M, RX9000)": "rocm.for.official.Support.7z",
-    "gfx1010/1012 xnack- ('Navi 10', RX 5700/5600/5500 XT)": "rocm.gfx1010-xnack-gfx1012-xnack-.for.hip6.4.2.7z",
-    "gfx1012 without xnack- / gfx1100 Mixed": "rocm.gfx1100.gfx1012.for.hip.6.4.2.7z",
-    "gfx1031 ('Navi 22', RX 6700/6750 XT)": "rocm.gfx1031.for.hip.6.4.2.7z",
-    "gfx1032 ('Navi 23', RX 6600/6650 XT, RX 7600)": "rocm.gfx1032.for.hip.6.4.2.7z",
-    "gfx1034/1035/1036 ('Navi 24', RX 6500 XT, 6400, 680M APU)": "rocm.gfx1034.gfx1035.gfx1036.for.hip.6.4.2.7z",
-    "gfx1103 ('Phoenix', 780M/880M APU)": "rocm.gfx1103.for.hip.6.4.2.7z",
-    "gfx1152 (Strix / Ryzen AI 300 APU)": "rocm.gfx1152.for.hip.6.4.2.7z",
-    "gfx1153 (Strix / Ryzen AI 300 APU)": "rocm.gfx1153.for.hip.6.4.2.7z"
-}
-
-
-def get_rocm_url(gpu_model: str) -> Optional[str]:
-    """Retrieve ROCm download URL for a specific GPU model."""
-    if gpu_model in GPU_ROCM_MAPPING:
-        return BASE_URL + GPU_ROCM_MAPPING[gpu_model]
-    return None
+# Profiles have separate verified packages for each supported ROCm SDK.
+GPU_ROCM_MAPPING = GPU_PACKAGES
 
 
 def get_system_amd_gpus() -> List[str]:
@@ -73,27 +59,7 @@ def get_system_amd_gpus() -> List[str]:
 
 
 def auto_match_gpu_to_key(gpu_name: str) -> str:
-    """Map detected GPU string to the internal architecture key."""
-    gpu_name_upper = gpu_name.upper()
-
-    if any(x in gpu_name_upper for x in ["7900", "7800", "7700", "6900", "6950", "6800", "890M", "9070", "9060"]):
-        return "Official Support (Navi 31/32, Vega 20, 890M, RX9000)"
-
-    if "780M" in gpu_name_upper or "880M" in gpu_name_upper:
-        return "gfx1103 ('Phoenix', 780M/880M APU)"
-    elif any(x in gpu_name_upper for x in ["6700", "6750"]):
-        return "gfx1031 ('Navi 22', RX 6700/6750 XT)"
-    elif any(x in gpu_name_upper for x in ["6600", "6650", "7600"]):
-        return "gfx1032 ('Navi 23', RX 6600/6650 XT, RX 7600)"
-    elif any(x in gpu_name_upper for x in ["6500", "6400", "680M"]):
-        return "gfx1034/1035/1036 ('Navi 24', RX 6500 XT, 6400, 680M APU)"
-    elif any(x in gpu_name_upper for x in ["5700", "5600", "5500"]):
-        return "gfx1010/1012 xnack- ('Navi 10', RX 5700/5600/5500 XT)"
-
-    if "GRAPHICS" in gpu_name_upper and not any(char.isdigit() for char in gpu_name):
-        return "AMBIGUOUS_APU"
-
-    return ""
+    return match_gpu(gpu_name)
 
 
 def restart_as_admin():
@@ -130,7 +96,7 @@ class ProxySelector:
 
     def __init__(self, master_gui):
         self.master_gui = master_gui
-        self.root = master_gui.master
+        self.root = master_gui.content
         self.proxies: Dict[str, str] = self.load_proxies()
         self.selected_proxy = tk.StringVar(value="Default (No Proxy)")
         self.custom_proxy = tk.StringVar()
@@ -230,7 +196,8 @@ class ProxySelector:
             test_url = "https://github.com/likelovewant/ollama-for-amd"
         try:
             start_time = time.time()
-            requests.get(test_url, timeout=5)
+            with requests.get(test_url, timeout=5) as response:
+                response.raise_for_status()
             return time.time() - start_time
         except Exception:
             return float('inf')
@@ -247,7 +214,7 @@ class ProxySelector:
     def test_all_proxies(self):
         """Execute connectivity tests for all known endpoints."""
         ping_results = {}
-        for name, url in self.proxies.items():
+        for name, url in list(self.proxies.items()):
             r_time = self.test_proxy(name, url)
             ping_results[name] = r_time
             self.root.after(0, self.update_result_display, name, r_time)
@@ -286,11 +253,23 @@ class OllamaInstallerGUI:
     def __init__(self, master):
         self.master = master
         master.title("Ollama For AMD Installer")
-        master.geometry("750x920")
-        master.minsize(700, 850)
-
+        available_height = max(500, master.winfo_screenheight() - 100)
+        master.geometry(f"850x{min(1000, available_height)}")
+        master.minsize(700, min(650, available_height))
         master.columnconfigure(0, weight=1)
-        master.rowconfigure(4, weight=1)
+        master.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(master, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(master, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.content = ttk.Frame(self.canvas)
+        content_window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.columnconfigure(0, weight=1)
+        self.content.rowconfigure(4, weight=1)
+        self.content.bind("<Configure>", lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(content_window, width=event.width))
+        master.bind("<MouseWheel>", self._scroll_window)
 
         self.repo = "likelovewant/ollama-for-amd"
         self.base_url = f"https://github.com/{self.repo}/releases/download"
@@ -298,6 +277,12 @@ class OllamaInstallerGUI:
         self.gpu_var = tk.StringVar()
         self.ollama_path_var = tk.StringVar()
         self.github_access_token_var = tk.StringVar()
+        self.rocm_version_var = tk.StringVar(value="7.1.1")
+        self.framework_path_var = tk.StringVar()
+        self.gpu_archive_path_var = tk.StringVar()
+        self.igpu_var = tk.BooleanVar(value=False)
+        self._busy = False
+        self._task_options = {}
 
         self.create_widgets()
         self.proxy_selector = ProxySelector(self)
@@ -307,7 +292,7 @@ class OllamaInstallerGUI:
         """Construct the graphical interface components."""
         # Hardware configuration section
         gpu_frame = ttk.LabelFrame(
-            self.master, text="💻 GPU Configuration", padding=(10, 5))
+            self.content, text="💻 GPU Configuration", padding=(10, 5))
         gpu_frame.grid(row=0, column=0, columnspan=2,
                        pady=10, padx=10, sticky="ew")
         gpu_frame.columnconfigure(1, weight=1)
@@ -322,9 +307,17 @@ class OllamaInstallerGUI:
             gpu_frame, text="🔍 Auto-Detect", command=self.detect_gpu)
         self.detect_btn.grid(row=0, column=2, pady=5, padx=5, sticky="e")
 
+        ttk.Label(gpu_frame, text="ROCm SDK:").grid(row=1, column=0, padx=5, sticky="w")
+        self.rocm_combo = ttk.Combobox(gpu_frame, textvariable=self.rocm_version_var,
+                                      values=ROCM_VERSIONS, state="readonly")
+        self.rocm_combo.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        self.igpu_check = ttk.Checkbutton(gpu_frame, text="Enable integrated GPU",
+                                         variable=self.igpu_var)
+        self.igpu_check.grid(row=1, column=2, padx=5)
+
         # Operational tasks section
         actions_frame = ttk.LabelFrame(
-            self.master, text="🚀 Installation Actions", padding=(10, 5))
+            self.content, text="🚀 Installation Actions", padding=(10, 5))
         actions_frame.grid(row=1, column=0, columnspan=2,
                            pady=5, padx=10, sticky="ew")
         actions_frame.columnconfigure(1, weight=1)
@@ -339,11 +332,13 @@ class OllamaInstallerGUI:
         path_btns_frame = ttk.Frame(actions_frame)
         path_btns_frame.grid(row=0, column=2, pady=5, padx=5, sticky="e")
         
-        ttk.Button(path_btns_frame, text="📂 Browse", command=self.browse_path, width=10).pack(side="left", padx=2)
-        ttk.Button(path_btns_frame, text="🔄 Reset", command=self.reset_path, width=10).pack(side="left", padx=2)
+        self.browse_button = ttk.Button(path_btns_frame, text="📂 Browse", command=self.browse_path, width=10)
+        self.browse_button.pack(side="left", padx=2)
+        self.reset_button = ttk.Button(path_btns_frame, text="🔄 Reset", command=self.reset_path, width=10)
+        self.reset_button.pack(side="left", padx=2)
 
         self.check_button = ttk.Button(
-            actions_frame, text="1. Full Install (App + AMD Libs)", command=self.full_install_thread)
+            actions_frame, text="1. Install Matched App + AMD Libs", command=self.full_install_thread)
         self.check_button.grid(
             row=1, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
 
@@ -353,14 +348,14 @@ class OllamaInstallerGUI:
             row=2, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
 
         self.vulkan_button = ttk.Button(
-            actions_frame, text="3. Force Vulkan Mode (Optional fix if GPU still not detected)",
+            actions_frame, text="3. Enable Vulkan (available by default in current Ollama)",
             command=self.enable_vulkan_thread)
         self.vulkan_button.grid(
             row=3, column=0, columnspan=3, pady=5, padx=5, sticky="ew")
 
         # Configuration and manual fixes section
         troubleshoot_frame = ttk.LabelFrame(
-            self.master, text="🛠️ Troubleshooting & Configuration", padding=(10, 5))
+            self.content, text="🛠️ Troubleshooting & Configuration", padding=(10, 5))
         troubleshoot_frame.grid(
             row=3, column=0, columnspan=2, pady=5, padx=10, sticky="ew")
         troubleshoot_frame.columnconfigure(1, weight=1)
@@ -370,18 +365,32 @@ class OllamaInstallerGUI:
         self.fix_button.grid(row=0, column=0, pady=5, padx=5, sticky="ew")
 
         self.cleanup_button = ttk.Button(
-            troubleshoot_frame, text="Cleanup AMD Libs", command=self.cleanup_thread)
+            troubleshoot_frame, text="Restore Last Injection Backup", command=self.cleanup_thread)
         self.cleanup_button.grid(row=0, column=1, pady=5, padx=5, sticky="ew")
 
         ttk.Label(troubleshoot_frame, text="GitHub PAT:").grid(
             row=1, column=0, pady=5, sticky="w")
         self.github_entry = ttk.Entry(
-            troubleshoot_frame, textvariable=self.github_access_token_var)
+            troubleshoot_frame, textvariable=self.github_access_token_var, show="*")
         self.github_entry.grid(row=1, column=1, pady=5, padx=5, sticky="ew")
+
+        ttk.Label(actions_frame, text="Local packages (optional, both required for offline injection):").grid(
+            row=4, column=0, columnspan=3, padx=5, sticky="w")
+        self.local_entries = []
+        self.local_buttons = []
+        for row, label, variable in ((5, "Framework:", self.framework_path_var),
+                                      (6, "GPU libs:", self.gpu_archive_path_var)):
+            ttk.Label(actions_frame, text=label).grid(row=row, column=0, padx=5, sticky="w")
+            entry = ttk.Entry(actions_frame, textvariable=variable)
+            entry.grid(row=row, column=1, pady=3, padx=5, sticky="ew")
+            button = ttk.Button(actions_frame, text="Browse", command=lambda v=variable: self.browse_archive(v))
+            button.grid(row=row, column=2, padx=5)
+            self.local_entries.append(entry)
+            self.local_buttons.append(button)
 
         # Output console and status section
         console_frame = ttk.LabelFrame(
-            self.master, text="🖥️ Console Output", padding=(10, 5))
+            self.content, text="🖥️ Console Output", padding=(10, 5))
         console_frame.grid(row=4, column=0, columnspan=2,
                            pady=5, padx=10, sticky="nsew")
         console_frame.columnconfigure(0, weight=1)
@@ -409,6 +418,22 @@ class OllamaInstallerGUI:
         link.bind("<Button-1>", lambda e: webbrowser.open_new_tab(self.github_url))
 
         self.log_msg("Ready for input.")
+
+    def _scroll_window(self, event):
+        if event.widget.winfo_class() not in ("Text", "TCombobox"):
+            self.canvas.yview_scroll(-int(event.delta / 120), "units")
+
+    def browse_archive(self, variable):
+        filename = filedialog.askopenfilename(filetypes=[("Archives", "*.zip *.7z")])
+        if filename:
+            variable.set(filename)
+
+    def on_close(self):
+        if self._busy:
+            messagebox.showinfo("Operation Running", "Wait for the current operation to finish before closing.")
+            return
+        self.save_settings()
+        self.master.destroy()
 
     def browse_path(self):
         """Open a directory selection dialog."""
@@ -486,9 +511,10 @@ class OllamaInstallerGUI:
 
         if matched_key == "AMBIGUOUS_APU":
             messagebox.showwarning(
-                "Generic Device", f"Integrated GPU detected: {matched_gpu_name}\nRyzen 7000+ -> gfx1103\nRyzen 6000 -> gfx1034")
+                "Generic Device", f"Integrated GPU detected: {matched_gpu_name}\nCheck the GPU model or gfx architecture before selecting a profile.")
         elif matched_key:
             self.gpu_var.set(matched_key)
+            self.igpu_var.set(any(x in matched_gpu_name.upper() for x in ("680M", "780M", "880M", "890M", "8060S", "8050S", "840M", "860M", "820M")))
             self.log_msg(f"Auto-selected: {matched_key}")
             messagebox.showinfo(
                 "GPU Identified", f"Device: {matched_gpu_name}\nProfile: {matched_key}")
@@ -506,399 +532,271 @@ class OllamaInstallerGUI:
         time.sleep(1)
 
     def find_ollama_path(self) -> Optional[str]:
-        """Discover the installation directory of Ollama."""
-        # Check manual input first
-        manual_path = self.ollama_path_var.get().strip()
+        manual_path = self._task_options.get("path", "").strip()
         if manual_path:
-            if os.path.exists(manual_path):
-                # Validate that it looks like an Ollama directory
-                if os.path.exists(os.path.join(manual_path, "ollama.exe")):
-                    return manual_path
-                else:
-                    self.log_msg(f"⚠️ Warning: 'ollama.exe' not found in {manual_path}")
-                    if not messagebox.askyesno("Invalid Path?", 
-                        f"The selected folder does not appear to contain 'ollama.exe'.\n\nPath: {manual_path}\n\nDo you want to use it anyway?"):
-                        return None
-                    return manual_path
-            else:
-                self.log_msg(f"❌ Error: Selected path does not exist: {manual_path}")
-                return None
-
-        for root_key in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
-            try:
-                hkey = winreg.OpenKey(
-                    root_key, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Ollama")
-                install_path = winreg.QueryValueEx(hkey, "InstallLocation")[0]
-                winreg.CloseKey(hkey)
-                if os.path.exists(install_path):
-                    return install_path
-            except Exception:
-                pass
-
+            if not os.path.isfile(os.path.join(manual_path, "ollama.exe")):
+                raise ValueError("Select the installation folder containing ollama.exe.")
+            return os.path.abspath(manual_path)
+        registry_path = self.find_ollama_path_from_registry()
+        if registry_path:
+            return registry_path
         default_path = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama")
-        if os.path.exists(default_path):
+        if os.path.isfile(os.path.join(default_path, "ollama.exe")):
             return default_path
-        return None
-
-    def _get_auth_headers(self):
-        """Generate headers for GitHub API requests."""
-        token = self.github_access_token_var.get().strip()
-        return {"Authorization": f"Bearer {token}"} if token else None
-
-    def check_rate_limit(self, response):
-        """Verify GitHub API quota status."""
-        if response.status_code in [403, 429]:
-            if response.headers.get("x-ratelimit-remaining") == "0":
-                raise APILimitRateError()
-        response.raise_for_status()
-
-    def get_latest_release(self) -> str:
-        """Fetch the latest version tag of the ROCm library project."""
-        url = "https://api.github.com/repos/likelovewant/ollama-for-amd/releases/latest"
-        response = requests.get(url, headers=self._get_auth_headers())
-        self.check_rate_limit(response)
-        return response.json()["tag_name"]
-
-    def full_install_thread(self):
-        """Start full installation in a background thread."""
-        threading.Thread(target=self._execute_full_install,
-                         daemon=True).start()
-
-    def replace_only_thread(self):
-        """Start library injection in a background thread."""
-        threading.Thread(target=self._execute_replace_only,
-                         daemon=True).start()
-
-    def enable_vulkan_thread(self):
-        """Start Vulkan configuration in a background thread."""
-        threading.Thread(target=self._execute_enable_vulkan,
-                         daemon=True).start()
-
-    def fix_05Error_thread(self):
-        """Start 0xc0000005 error fix in a background thread."""
-        threading.Thread(target=self.fix_05Error, daemon=True).start()
-
-    def cleanup_thread(self):
-        """Start cleanup in a background thread."""
-        threading.Thread(target=self._execute_cleanup, daemon=True).start()
-
-    def _execute_cleanup(self):
-        """Perform a complete undo of the installation/injection workflow."""
-        try:
-            self.set_ui_state("disabled")
-            ollama_path = self.find_ollama_path()
-            if not ollama_path:
-                self.log_msg("❌ Cleanup aborted: No target path identified.")
-                return
-
-            msg = (f"This will completely REMOVE injected files and components from:\n{ollama_path}\n\n"
-                   "This includes:\n"
-                   "- ollama.exe & ollama app.exe\n"
-                   "- The entire 'lib' folder (ROCm libraries & runners)\n"
-                   "- Vulkan & ROCm environment overrides\n\n"
-                   "Note: This effectively uninstalls the AMD-compatible Ollama. Continue?")
-            
-            if not messagebox.askyesno("Confirm Full Undo", msg):
-                self.log_msg("Cleanup cancelled by user.")
-                return
-
-            self.kill_ollama()
-            self.log_msg(f"Initiating full undo in target path: {ollama_path}")
-
-            # 1. Remove Environment Variables
-            self.log_msg("Step 1/3: Cleaning up registry environment variables...")
-            try:
-                reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS)
-                for var in ["OLLAMA_VULKAN", "HSA_OVERRIDE_GFX_VERSION"]:
-                    try:
-                        winreg.DeleteValue(reg_key, var)
-                        self.log_msg(f"  [REGISTRY] Successfully deleted environment variable: {var}")
-                    except FileNotFoundError:
-                        self.log_msg(f"  [REGISTRY] Variable {var} not found, skipping.")
-                winreg.CloseKey(reg_key)
-            except Exception as e:
-                self.log_msg(f"  [ERROR] Registry operation failed: {e}")
-
-            # 2. Remove Files and Folders
-            self.log_msg("Step 2/3: Removing application files and libraries...")
-            targets = ["ollama.exe", "ollama app.exe", "lib"]
-            for target in targets:
-                target_path = os.path.normpath(os.path.join(ollama_path, target))
-                if os.path.exists(target_path):
-                    self.log_msg(f"  [FILESYSTEM] Attempting to remove: {target_path}")
-                    try:
-                        if os.path.isdir(target_path):
-                            shutil.rmtree(target_path, ignore_errors=True)
-                            if os.path.exists(target_path):
-                                self.log_msg(f"  [WARN] Failed to delete directory {target} completely (likely in use).")
-                            else:
-                                self.log_msg(f"  [OK] Directory {target} removed.")
-                        else:
-                            os.remove(target_path)
-                            self.log_msg(f"  [OK] File {target} removed.")
-                    except Exception as e:
-                        self.log_msg(f"  [ERROR] Failed to remove {target}: {e}")
-                else:
-                    self.log_msg(f"  [FILESYSTEM] Component {target} not found at {target_path}, skipping.")
-
-            # 3. Final Path cleanup (Audit Only)
-            self.log_msg("Step 3/3: Performing final directory audit...")
-            try:
-                if os.path.exists(ollama_path):
-                    contents = os.listdir(ollama_path)
-                    if not contents:
-                        self.log_msg(f"  [INFO] Target directory {ollama_path} is now empty.")
-                    else:
-                        self.log_msg(f"  [INFO] Target directory {ollama_path} still contains other files ({len(contents)} items).")
-                    self.log_msg(f"  [INFO] Base directory preserved.")
-            except Exception as e:
-                self.log_msg(f"  [ERROR] Final audit failed: {e}")
-
-            self.log_msg("✅ Full undo/cleanup completed successfully.")
-            self._show_info("Cleanup Complete", "All components have been removed.")
-        except Exception as e:
-            self.log_msg(f"❌ CRITICAL ERROR during cleanup: {e}")
-            logging.exception("Cleanup failure details:")
-            self._show_error("Error", f"Cleanup failed: {e}")
-        finally:
-            self.set_ui_state("normal")
+        executable = shutil.which("ollama.exe")
+        if executable:
+            return os.path.dirname(executable)
+        raise ValueError("Ollama installation not found. Select its folder with Browse.")
 
     def find_ollama_path_from_registry(self) -> Optional[str]:
-        """Helper to get path strictly from system registry."""
         for root_key in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
             try:
-                hkey = winreg.OpenKey(
-                    root_key, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Ollama")
-                install_path = winreg.QueryValueEx(hkey, "InstallLocation")[0]
-                winreg.CloseKey(hkey)
-                if os.path.exists(install_path):
-                    return install_path
-            except Exception:
+                with winreg.OpenKey(root_key, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Ollama") as hkey:
+                    install_path = winreg.QueryValueEx(hkey, "InstallLocation")[0]
+                    if os.path.isfile(os.path.join(install_path, "ollama.exe")):
+                        return install_path
+            except OSError:
                 pass
         return None
 
-    def _execute_enable_vulkan(self):
-        """Configure system environment for Vulkan acceleration."""
-        try:
-            self.set_ui_state("disabled")
-            self.log_msg("Activating Vulkan Acceleration Mode...")
-            reg_key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_ALL_ACCESS)
-            winreg.SetValueEx(reg_key, "OLLAMA_VULKAN", 0, winreg.REG_SZ, "1")
-            self.log_msg("Configuration saved: OLLAMA_VULKAN = 1")
+    def _get_auth_headers(self, url="https://api.github.com"):
+        token = self._task_options.get("token", "")
+        # Never send the PAT to a user-configured download mirror.
+        if token and urlsplit(url).hostname in ("api.github.com", "github.com"):
+            return {"Authorization": f"Bearer {token}"}
+        return None
+
+    def check_rate_limit(self, response):
+        if response.status_code == 429 or (response.status_code == 403 and
+                response.headers.get("x-ratelimit-remaining") == "0"):
+            raise APILimitRateError("GitHub API rate limit reached. Enter a PAT or use local packages.")
+        response.raise_for_status()
+
+    def _github_json(self, endpoint):
+        url = f"https://api.github.com/{endpoint}"
+        with requests.get(url, headers=self._get_auth_headers(url), timeout=(10, 60)) as response:
+            self.check_rate_limit(response)
+            return response.json()
+
+    def get_release_plan(self, installed_tag=None):
+        version = self._task_options["rocm"]
+        # Empty newer releases are normal upstream; examine actual downloadable assets.
+        releases = self._github_json(f"repos/{AMD_REPO}/releases?per_page=100")
+        if installed_tag:
+            releases = [release for release in releases if release["tag_name"] == installed_tag]
             try:
-                winreg.DeleteValue(reg_key, "HSA_OVERRIDE_GFX_VERSION")
-                self.log_msg("Cleaned up legacy ROCm overrides.")
-            except FileNotFoundError:
-                pass
-            winreg.CloseKey(reg_key)
-            self.kill_ollama()
-            self.log_msg("✅ Vulkan configuration complete.")
-            self._show_info(
-                "Vulkan Enabled", "Settings applied. Please manually restart Ollama to take effect.")
-        except Exception as e:
-            self.log_msg(f"Registry operation failed: {e}")
-            self._show_error("Error", f"Failed to update environment: {e}")
-        finally:
-            self.set_ui_state("normal")
+                plan = select_release(releases, version)
+            except CompatibilityError as error:
+                raise CompatibilityError(f"No matched ROCm {version} backend for installed Ollama {installed_tag}. "
+                                         "Use Install Matched App + AMD Libs, or the current official Vulkan backend.") from error
+        else:
+            plan = select_release(releases, version)
+        libraries = self._github_json(f"repos/{LIB_REPO}/releases/tags/v0.{version}")
+        plan["gpu"] = select_gpu_asset(libraries, self._task_options["gpu"], version)
+        self.log_msg(f"Selected Ollama {plan['tag']} + ROCm {version}: {plan['framework']['name']}")
+        return plan
+
+    def installed_client_tag(self):
+        executable = os.path.join(self.find_ollama_path(), "ollama.exe")
+        result = subprocess.run([executable, "--version"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=15,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        return parse_client_version(result.stdout + "\n" + result.stderr)
+
+    def _start_task(self, target):
+        if self._busy:
+            return
+        self._task_options = {
+            "gpu": self.gpu_var.get(), "path": self.ollama_path_var.get().strip(),
+            "token": self.github_access_token_var.get().strip(),
+            "proxy": self.proxy_selector.get_selected_proxy_url(),
+            "rocm": self.rocm_version_var.get(), "igpu": self.igpu_var.get(),
+            "framework": self.framework_path_var.get().strip(),
+            "gpu_archive": self.gpu_archive_path_var.get().strip(),
+        }
+        self._busy = True
+        self._set_ui_state_sync("disabled")
+        def run():
+            try:
+                target()
+            except Exception as error:
+                logging.exception("Operation failed")
+                self.log_msg(f"Operation failed: {error}")
+                self._show_error("Error", str(error))
+            finally:
+                self.master.after(0, self._finish_task)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _finish_task(self):
+        self._busy = False
+        self._task_options.pop("token", None)
+        self._set_ui_state_sync("normal")
+
+    def full_install_thread(self):
+        self._start_task(self._execute_full_install)
+
+    def replace_only_thread(self):
+        self._start_task(self._execute_replace_only)
+
+    def enable_vulkan_thread(self):
+        self._start_task(self._execute_enable_vulkan)
+
+    def fix_05Error_thread(self):
+        self._start_task(self.fix_05Error)
+
+    def cleanup_thread(self):
+        if self._busy:
+            return
+        if messagebox.askyesno("Restore Injection", "Restore files saved before the last AMD injection?\nOllama will be stopped while restoring."):
+            self._start_task(self._execute_cleanup)
+
+    def _execute_cleanup(self):
+        ollama_path = self.find_ollama_path()
+        backup = latest_backup(ollama_path)
+        if not backup:
+            raise ValueError("No injection backup found for this installation.")
+        self.kill_ollama()
+        restore_backup(ollama_path, backup)
+        self.log_msg("Original files restored from the last injection backup.")
+        self._show_info("Restored", "Previous files restored. Restart Ollama manually.")
+
+    def _execute_enable_vulkan(self):
+        self.log_msg("Enabling Vulkan acceleration...")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "OLLAMA_VULKAN", 0, winreg.REG_SZ, "1")
+        self.log_msg("OLLAMA_VULKAN=1 set. Current official Ollama enables Vulkan by default.")
+        self._show_info("Vulkan Enabled", "Sign out/in to refresh the environment, then restart Ollama.")
+
+    def _validate_injection_options(self):
+        options = self._task_options
+        if options["gpu"] not in GPU_ROCM_MAPPING:
+            raise ValueError("Select a GPU profile.")
+        if bool(options["framework"]) != bool(options["gpu_archive"]):
+            raise ValueError("Select both local framework and GPU library archives, or clear both fields.")
+
+    def _download_asset(self, asset, cache):
+        filename = os.path.join(cache, asset["name"])
+        os.makedirs(cache, exist_ok=True)
+        if os.path.isfile(filename):
+            try:
+                verify_asset(filename, asset)
+                self.log_msg(f"Verified cached package: {asset['name']}")
+                return filename
+            except ValueError:
+                self.log_msg(f"Replacing invalid cache: {asset['name']}")
+        self.download_file(self._task_options["proxy"] + asset["browser_download_url"], filename,
+                           asset=asset)
+        return filename
+
+    def _stage_injection(self, work, plan=None):
+        self._validate_injection_options()
+        options = self._task_options
+        if options["framework"]:
+            framework, gpu_archive = options["framework"], options["gpu_archive"]
+            self.log_msg(f"Using local packages with selected ROCm SDK {options['rocm']}.")
+        else:
+            plan = plan or self.get_release_plan()
+            framework = self._download_asset(plan["framework"], os.path.join("downloads", plan["tag"]))
+            gpu_archive = self._download_asset(plan["gpu"], os.path.join("downloads", "rocm-" + plan["rocm"]))
+        fw_dir, gpu_dir, stage = (os.path.join(work, part) for part in ("framework", "gpu", "stage"))
+        self.log_msg("Extracting and validating packages before changing the installation...")
+        extract_archive(framework, fw_dir)
+        extract_archive(gpu_archive, gpu_dir)
+        targets = prepare_payload(fw_dir, gpu_dir, stage, options["rocm"])
+        return stage, targets
+
+    def _apply_injection(self, stage, targets):
+        ollama_path = self.find_ollama_path()
+        self.kill_ollama()
+        backup = deploy_payload(stage, ollama_path, targets)
+        self.log_msg(f"Injection complete. Backup: {backup}")
+        if self._task_options["igpu"]:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, "OLLAMA_IGPU_ENABLE", 0, winreg.REG_SZ, "1")
+                self.log_msg("OLLAMA_IGPU_ENABLE=1 set. Sign out/in before restarting Ollama to refresh its environment.")
+            except OSError as error:
+                self.log_msg(f"Files installed; integrated GPU setting failed: {error}")
+                self._show_warning("Integrated GPU Setting", "Files installed, but OLLAMA_IGPU_ENABLE could not be set. Set it manually.")
+        self._show_info("Success", "Matched AMD libraries installed. Restart Ollama manually.\nUse Restore Last Injection Backup to undo file changes.")
 
     def _execute_full_install(self):
-        """Orchestrate official app installation followed by library injection."""
-        try:
-            self.set_ui_state("disabled")
-            exe_url = "https://ollama.com/download/OllamaSetup.exe"
-            exe_filename = "OllamaSetup_Official.exe"
-            self.log_msg("Acquiring official installer...")
-            self.download_file(exe_url, exe_filename, is_github_url=False)
-            self.log_msg("Launching setup...")
+        self._validate_injection_options()
+        if self._task_options["framework"]:
+            raise ValueError("For local packages, install Ollama first and use Inject AMD Libs Only.")
+        plan = self.get_release_plan()
+        setup = plan["setup"]
+        if not setup:
+            # An exact-tag official installer prevents accidental latest-version ABI mixing.
+            official = self._github_json(f"repos/ollama/ollama/releases/tags/{plan['tag']}")
+            setup = next((a for a in official["assets"] if a["name"] == "OllamaSetup.exe"), None)
+            if not setup:
+                raise CompatibilityError("No installer for the selected compatible release. Install Ollama manually, then inject.")
+        exe_filename = self._download_asset(setup, os.path.join("downloads", plan["tag"], "setup"))
+        with tempfile.TemporaryDirectory(prefix="ollama-amd-") as work:
+            stage, targets = self._stage_injection(work, plan)
+            self.log_msg(f"Installing matched Ollama {plan['tag']}...")
             self.kill_ollama()
-            
-            install_args = [exe_filename, "/SILENT"]
-            custom_dir = self.ollama_path_var.get().strip()
+            install_args = [os.path.abspath(exe_filename), "/SILENT", "/NORESTART"]
+            custom_dir = self._task_options["path"]
             if custom_dir:
-                install_args.append(f'/DIR={custom_dir}')
-                self.log_msg(f"Target directory: {custom_dir}")
-                
+                install_args.append(f"/DIR={os.path.abspath(custom_dir)}")
             subprocess.run(install_args, check=True)
-            self._execute_replace_only()
-        except Exception as e:
-            self.log_msg(f"Installer error: {e}")
-            self._show_error("Error", f"Setup failed: {e}")
-        finally:
-            self.set_ui_state("normal")
+            self._apply_injection(stage, targets)
 
     def _execute_replace_only(self):
-        """Manage library retrieval and injection process."""
-        try:
-            self.set_ui_state("disabled")
-            gpu_model = self.gpu_var.get()
-            if not gpu_model:
-                self._show_warning(
-                    "Incomplete Input", "Select a GPU profile.")
-                return
-
-            self.log_msg(f"🚀 Injection started for GPU Profile: {gpu_model}")
-            version_tag = self.get_latest_release()
-            self.log_msg(f"Latest release found: {version_tag}")
-            
-            os.makedirs(version_tag, exist_ok=True)
-            proxy_url = self.proxy_selector.get_selected_proxy_url()
-            self.log_msg(f"Using proxy: {proxy_url if proxy_url else 'None'}")
-            
-            ollama_path = self.find_ollama_path()
-            if not ollama_path:
-                self.log_msg("❌ Error: Ollama installation path not found. Please select it manually.")
-                self._show_error("Path Not Found", "Ollama installation directory could not be located. Please use the 'Browse' button to select it.")
-                return
-
-            self.log_msg(f"Target path verified: {ollama_path}")
-            rocm_lib_dir = os.path.join(ollama_path, "lib", "ollama", "rocm")
-            base_archive = os.path.join(version_tag, "ollama-windows-amd64.7z")
-
-            if not os.path.exists(base_archive):
-                self.log_msg(f"Step 1/3: Downloading core framework archive: {os.path.basename(base_archive)}")
-                self.download_file(
-                    f"{proxy_url}{self.base_url}/{version_tag}/ollama-windows-amd64.7z", base_archive)
-            else:
-                self.log_msg("Step 1/3: Found cached core framework, skipping download.")
-
-            self.kill_ollama()
-            
-            self.log_msg("Step 2/3: Extracting and deploying core framework...")
-            temp_fw_dir = tempfile.mkdtemp()
-            self.log_msg(f"  [TEMP] Creating extraction workspace: {temp_fw_dir}")
-            try:
-                with py7zr.SevenZipFile(base_archive, 'r') as archive:
-                    self.log_msg("  [EXTRACT] Unpacking files...")
-                    archive.extractall(path=temp_fw_dir)
-                    
-                fw_extracted_root = os.path.join(temp_fw_dir, "windows-amd64")
-                if not os.path.exists(fw_extracted_root):
-                    fw_extracted_root = temp_fw_dir
-                
-                self.log_msg(f"  [DEPLOY] Moving framework files to {ollama_path}...")
-                shutil.copytree(fw_extracted_root, ollama_path, dirs_exist_ok=True)
-            finally:
-                self.log_msg("  [TEMP] Cleaning up workspace.")
-                shutil.rmtree(temp_fw_dir, ignore_errors=True)
-
-            gpu_url = get_rocm_url(gpu_model)
-            if not gpu_url:
-                raise ValueError(f"Could not resolve download URL for profile: {gpu_model}")
-
-            gpu_archive = os.path.join(version_tag, os.path.basename(gpu_url))
-            if not os.path.exists(gpu_archive):
-                self.log_msg(f"Step 3/3: Downloading specific driver libs for {gpu_model}...")
-                self.download_file(f"{proxy_url}{gpu_url}", gpu_archive)
-            else:
-                self.log_msg("Step 3/3: Found cached driver libs, skipping download.")
-
-            self.log_msg(f"Deploying ROCm DLLs to {rocm_lib_dir}...")
-            temp_dir = tempfile.mkdtemp()
-            try:
-                with py7zr.SevenZipFile(gpu_archive, "r") as zip_ref:
-                    self.log_msg("  [EXTRACT] Unpacking driver libs...")
-                    zip_ref.extractall(path=temp_dir)
-
-                payload_root = temp_dir
-                if len(os.listdir(temp_dir)) == 1:
-                    payload_root = os.path.join(temp_dir, os.listdir(temp_dir)[0])
-
-                self.log_msg(f"  [DEPLOY] Injecting rocblas.dll into {rocm_lib_dir}...")
-                shutil.copy2(os.path.join(payload_root, "rocblas.dll"), rocm_lib_dir)
-                
-                lib_content = os.path.join(payload_root, "library")
-                if os.path.exists(lib_content):
-                    self.log_msg("  [DEPLOY] Injecting rocblas library folder...")
-                    shutil.copytree(lib_content, os.path.join(
-                        rocm_lib_dir, "rocblas", "library"), dirs_exist_ok=True)
-            finally:
-                self.log_msg("  [TEMP] Cleaning up driver workspace.")
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-            self.log_msg("✅ Injection successful! All AMD libraries are in place.")
-            self._show_info(
-                "Success", "Hardware acceleration libraries updated.")
-        except Exception as e:
-            self.log_msg(f"❌ CRITICAL ERROR during injection: {e}")
-            logging.exception("Injection failure details:")
-            self._show_error("Error", f"Process failed: {e}")
-        finally:
-            self.set_ui_state("normal")
+        self._validate_injection_options()
+        self.find_ollama_path()
+        plan = None
+        if not self._task_options["framework"]:
+            plan = self.get_release_plan(self.installed_client_tag())
+        with tempfile.TemporaryDirectory(prefix="ollama-amd-") as work:
+            stage, targets = self._stage_injection(work, plan)
+            self._apply_injection(stage, targets)
 
     def fix_05Error(self):
-        """Relocate DLLs to fix application startup errors."""
+        """Repair shared DLL placement only in an existing legacy runner layout."""
+        ollama_path = self.find_ollama_path()
+        base_lib = Path(ollama_path) / "lib" / "ollama"
+        target_root = base_lib / "runners"
+        runners = sorted(target_root.glob("rocm_v*")) if target_root.is_dir() else []
+        libraries = list(base_lib.glob("*.dll"))
+        if len(runners) != 1 or not libraries:
+            raise CompatibilityError("This fix applies only to a legacy installation with one ROCm runner and shared DLLs. "
+                                     "For current layouts, inject matched packages or restore the last backup.")
+        self.kill_ollama()
+        for library in libraries:
+            shutil.copy2(library, runners[0] / library.name)
+        self.log_msg("Shared DLLs copied to the existing legacy ROCm runner.")
+        self._show_info("Runtime Files Updated", "Restart Ollama and retry. Check server.log if the error persists.")
+
+    def download_file(self, url: str, filename: str, is_github_url: bool = True, asset=None):
+        """Download atomically; failed/truncated downloads never become cache hits."""
+        partial = filename + ".part"
         try:
-            self.set_ui_state("disabled")
-            self.log_msg("Applying runtime fix...")
-            ollama_path = self.find_ollama_path()
-            if not ollama_path:
-                self.log_msg("❌ Error: Ollama installation path not found. Please select it manually.")
-                self._show_error("Path Not Found", "Ollama installation directory could not be located. Please use the 'Browse' button to select it.")
-                return
-            self.kill_ollama()
-            base_lib = os.path.join(ollama_path, "lib", "ollama")
-            target_root = os.path.join(base_lib, "runners")
-            os.makedirs(target_root, exist_ok=True)
-
-            dirs = [d for d in os.listdir(
-                target_root) if d.startswith("rocm_v")]
-            final_dest = os.path.join(target_root, sorted(
-                dirs)[-1] if dirs else "rocm_v6.4")
-            os.makedirs(final_dest, exist_ok=True)
-
-            for file_item in [f for f in os.listdir(base_lib) if f.endswith(".dll")]:
-                shutil.copy2(os.path.join(base_lib, file_item), final_dest)
-            self.log_msg("✅ Fix deployment complete.")
-            self._show_info("Success", "0xc0000005 fix implemented.")
-        except Exception as e:
-            self.log_msg(f"Fix failed: {e}")
-        finally:
-            self.set_ui_state("normal")
-
-    def download_file(self, url: str, filename: str, is_github_url: bool = True):
-        """Execute stream-based file download with progress monitoring."""
-        try:
-            auth_headers = self._get_auth_headers() if is_github_url else None
-            response = requests.get(url, headers=auth_headers, stream=True)
-            if is_github_url:
+            with requests.get(url, headers=self._get_auth_headers(url), stream=True,
+                              timeout=(10, 60)) as response:
                 self.check_rate_limit(response)
-            else:
-                response.raise_for_status()
-
-            file_size = int(response.headers.get("content-length", 0))
-            download_count = 0
-            start_ts = time.time()
-            
-            self.master.after(0, self._update_progress_sync, 0, file_size if file_size > 0 else 100)
-
-            display_name = os.path.basename(filename) if filename else "payload"
-
-            with open(filename, "wb") as file_out, tqdm(
-                total=file_size if file_size > 0 else None, 
-                unit="iB", 
-                unit_scale=True, 
-                desc=display_name, 
-                disable=(sys.stderr is None)
-            ) as pbar:
-                for segment in response.iter_content(chunk_size=8192):
-                    if not segment:
-                        continue
-                    file_out.write(segment)
-                    download_count += len(segment)
-                    pbar.update(len(segment))
-                    
-                    if file_size > 0:
-                        self.master.after(0, self._update_progress_sync, download_count, file_size)
-                    
-                    self._update_speed(download_count, start_ts)
-                    
-            self.master.after(0, self._update_speed_sync, "Download finished.")
-        except Exception as e:
-            self.log_msg(f"Network error: {e}")
-            if os.path.exists(filename):
-                os.remove(filename)
-            raise
+                file_size = int(response.headers.get("content-length", 0))
+                download_count = 0
+                start_ts = time.time()
+                self.master.after(0, self._update_progress_sync, 0, file_size)
+                with open(partial, "wb") as output:
+                    for segment in response.iter_content(chunk_size=256 * 1024):
+                        if segment:
+                            output.write(segment)
+                            download_count += len(segment)
+                            self.master.after(0, self._update_progress_sync, download_count, file_size)
+                            self._update_speed(download_count, start_ts)
+                if file_size and download_count != file_size:
+                    raise ValueError("Download was truncated. Retry the download.")
+                if asset:
+                    verify_asset(partial, asset)
+                os.replace(partial, filename)
+                self.master.after(0, self._update_speed_sync, "Download verified.")
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
 
     def _update_speed(self, bytes_received: int, start_time: float):
         """Refresh download statistics in the interface."""
@@ -913,51 +811,67 @@ class OllamaInstallerGUI:
         self.master.after(0, self._set_ui_state_sync, state)
 
     def _set_ui_state_sync(self, state):
-        self.path_entry.config(state=state)
-        self.check_button.config(state=state)
-        self.replace_button.config(state=state)
-        self.vulkan_button.config(state=state)
-        self.fix_button.config(state=state)
-        self.cleanup_button.config(state=state)
-        self.detect_btn.config(state=state)
+        for widget in (self.path_entry, self.check_button, self.replace_button, self.vulkan_button,
+                       self.fix_button, self.cleanup_button, self.detect_btn, self.browse_button,
+                       self.reset_button, self.github_entry, self.igpu_check,
+                       *self.local_entries, *self.local_buttons):
+            widget.config(state=state)
+        for combo in (self.gpu_combo, self.rocm_combo, self.proxy_selector.proxy_combo):
+            combo.config(state="readonly" if state == "normal" else "disabled")
 
     def load_settings(self):
         """Retrieve user configuration from local storage."""
         try:
             if os.path.exists("settings.txt"):
-                with open("settings.txt", "r") as config_file:
+                with open("settings.txt", "r", encoding="utf-8") as config_file:
                     lines = config_file.readlines()
                     if len(lines) >= 1:
                         gpu_val = lines[0].strip()
                         if gpu_val in GPU_ROCM_MAPPING:
                             self.gpu_var.set(gpu_val)
+                        elif gpu_val.startswith("Official Support"):
+                            self.gpu_var.set(next(iter(GPU_ROCM_MAPPING)))
+                        elif gpu_val.startswith("gfx"):
+                            # Migrate saved architecture names from 0.4.x.
+                            prefix = gpu_val.split(" ")[0]
+                            match = next((key for key in GPU_ROCM_MAPPING if key.split(" ")[0] == prefix), None)
+                            if match:
+                                self.gpu_var.set(match)
                     if len(lines) >= 2:
                         path_val = lines[1].strip()
                         if os.path.exists(path_val):
                             self.ollama_path_var.set(path_val)
+                    if len(lines) >= 3 and lines[2].strip() in ROCM_VERSIONS:
+                        self.rocm_version_var.set(lines[2].strip())
+                    if len(lines) >= 4:
+                        self.igpu_var.set(lines[3].strip() == "1")
         except Exception:
             pass
 
     def save_settings(self):
         """Persist current user configuration to disk."""
         try:
-            with open("settings.txt", "w") as config_file:
+            with open("settings.txt", "w", encoding="utf-8") as config_file:
                 config_file.write(f"{self.gpu_var.get()}\n")
                 config_file.write(f"{self.ollama_path_var.get()}\n")
+                config_file.write(f"{self.rocm_version_var.get()}\n")
+                config_file.write("1\n" if self.igpu_var.get() else "0\n")
         except Exception:
             pass
 
 
 def main():
     """Main application entry point with privilege check."""
+    if sys.platform != "win32":
+        print("This installer supports Windows only. For Linux, use the official Ollama installation instructions.")
+        return
     if not is_admin():
         if messagebox.askyesno("Elevation Required", "Access to system directories is required.\nElevate now?"):
             restart_as_admin()
         return
     root_window = tk.Tk()
     app_instance = OllamaInstallerGUI(root_window)
-    root_window.protocol("WM_DELETE_WINDOW", lambda: (
-        app_instance.save_settings(), root_window.destroy()))
+    root_window.protocol("WM_DELETE_WINDOW", app_instance.on_close)
     root_window.mainloop()
 
 
